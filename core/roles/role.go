@@ -1,0 +1,131 @@
+package roles
+
+import (
+	"context"
+	"fmt"
+
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/intentd/kubewright/core/apply"
+	"github.com/intentd/kubewright/core/types"
+	"github.com/intentd/kubewright/internal/shared"
+)
+
+// Spec describes a Role.
+type Spec struct {
+	// Name — the Role's name. Required.
+	Name string
+	// Namespace — where to create it. Empty means the owner's.
+	Namespace string
+	// Labels — set on the object.
+	Labels map[string]string
+
+	// Annotations — set on the object.
+	Annotations map[string]string
+	// Rules — what the role allows, within its namespace.
+	Rules []rbacv1.PolicyRule
+}
+
+// Create creates the Role spec describes, owned by owner, unless it already
+// exists (Unchanged).
+func Create(ctx context.Context, kube kubernetes.Interface, owner types.Owner, spec Spec, opts types.Options) (types.Result, error) {
+	if err := validateSpec(spec); err != nil {
+		return "", fmt.Errorf("role.Create: invalid spec: %w", err)
+	}
+
+	namespace := shared.ResolveNamespace(owner, spec.Namespace)
+
+	_, err := kube.RbacV1().Roles(namespace).Get(ctx, spec.Name, metav1.GetOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		return "", fmt.Errorf("role.Create: checking existence of %q: %w", spec.Name, err)
+	}
+	if err == nil {
+		return types.Unchanged, nil
+	}
+
+	role := Build(owner, spec)
+
+	_, err = kube.RbacV1().Roles(namespace).Create(ctx, role, metav1.CreateOptions{FieldManager: opts.FieldManager})
+	if err != nil {
+		return "", fmt.Errorf("role.Create: creating role %q in %q: %w", spec.Name, namespace, err)
+	}
+
+	return types.Created, nil
+}
+
+// Apply writes the Role spec describes with server-side apply.
+func Apply(ctx context.Context, kube kubernetes.Interface, owner types.Owner, spec Spec, opts types.Options) (types.Result, error) {
+	namespace := shared.ResolveNamespace(owner, spec.Namespace)
+
+	role := Build(owner, spec)
+	role.TypeMeta = metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"}
+
+	if _, err := apply.Typed(ctx, kube.RbacV1().Roles(namespace), role, opts); err != nil {
+		return "", fmt.Errorf("role.Apply: %w", err)
+	}
+
+	return types.Applied, nil
+}
+
+// Delete deletes the Role (NotFound if it is already gone).
+func Delete(ctx context.Context, kube kubernetes.Interface, owner types.Owner, spec Spec) (types.Result, error) {
+	namespace := shared.ResolveNamespace(owner, spec.Namespace)
+
+	err := kube.RbacV1().Roles(namespace).Delete(ctx, spec.Name, metav1.DeleteOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return types.NotFound, nil
+		}
+		return "", fmt.Errorf("role.Delete: deleting role %q in %q: %w", spec.Name, namespace, err)
+	}
+
+	return types.Deleted, nil
+}
+
+// DeleteIfOwned deletes the Role only if owned reports true for it (NotOwned
+// otherwise).
+func DeleteIfOwned(ctx context.Context, kube kubernetes.Interface, name, namespace string, owned func(metav1.Object) bool) (types.Result, error) {
+	existing, err := kube.RbacV1().Roles(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return types.NotFound, nil
+		}
+		return "", err
+	}
+	if !owned(existing) {
+		return types.NotOwned, nil
+	}
+	if err := kube.RbacV1().Roles(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+		return "", err
+	}
+	return types.Deleted, nil
+}
+
+// ── Build and its helpers ─────────────────────────────────────────────────
+
+// Build returns the Role spec describes, in spec.Namespace or else the owner's namespace, with an owner reference to owner
+// where Kubernetes allows one (types.OwnerReferences). It reads nothing from
+// the cluster.
+func Build(owner types.Owner, spec Spec) *rbacv1.Role {
+	namespace := shared.ResolveNamespace(owner, spec.Namespace)
+	return &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            spec.Name,
+			Namespace:       namespace,
+			Labels:          spec.Labels,
+			Annotations:     spec.Annotations,
+			OwnerReferences: types.OwnerReferences(owner, namespace),
+		},
+		Rules: spec.Rules,
+	}
+}
+
+func validateSpec(spec Spec) error {
+	if spec.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	return nil
+}
